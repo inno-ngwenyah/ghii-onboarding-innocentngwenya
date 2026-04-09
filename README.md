@@ -1,4 +1,5 @@
 # ghii-onboarding-innocentngwenya
+--------------------------------------------
 Personal Development Environment checklist
 --------------------------------------------
 Linux Os - Ubuntu 24.04.4 LTS 
