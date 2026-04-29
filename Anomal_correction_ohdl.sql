@@ -1,5 +1,5 @@
 ================================================================
-#DQA Report Assignment - Anomaly Correction Queries for CENTRAL DATA 
+#DQA Report Assignment - Anomaly Correction Queries for CDR  
 ================================================================
 -----------------------------------------------------------------------
 #1.Clients missing gender or gender recorded in an inconsistent format
