@@ -1,0 +1,16 @@
+# ------------------------------------------------------------------------------
+# Contains items not to be included in a git commit 
+# ------------------------------------------------------------------------------
+
+# Credentials — never expose passwords
+.env
+
+# Patient data outputs — never commit real health data
+output/
+
+# Virtual environment — no need to share, each person recreates it
+.venv/
+
+# Python cache files — auto-generated, not needed
+__pycache__/
+*.pyc
