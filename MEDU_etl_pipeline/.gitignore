@@ -14,3 +14,4 @@ output/
 # Python cache files — auto-generated, not needed
 __pycache__/
 *.pyc
+.idea/
