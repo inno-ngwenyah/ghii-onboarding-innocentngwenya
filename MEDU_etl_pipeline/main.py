@@ -73,7 +73,6 @@ load(df_flat, "patient_initial_visit",
      create_sql=INITIAL_VISIT_DDL)
 
 # ------- PIPELINE 2: Follow-up Visits ---------------------------------------
-# ── Follow-up visits pipeline ─────────────────────────
 print("\n--- FOLLOW-UP VISITS PIPELINE ---")
 df_raw_fu  = extract_followup_visits(concept_route)
 print("Transforming data.....")

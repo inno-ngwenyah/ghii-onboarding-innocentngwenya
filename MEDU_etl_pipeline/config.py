@@ -68,7 +68,7 @@ def build_concept_route(engine) -> dict:
     """
     names = list(CONCEPT_DEFINITIONS.keys())
     placeholders = ", ".join([f"'{n}'" for n in names])
-# Pull concept and their names that we want to use
+# Pull concept IDs and their names that we want to use
     concept_name_query = text(f"""
         SELECT 
             cn.concept_id, 
