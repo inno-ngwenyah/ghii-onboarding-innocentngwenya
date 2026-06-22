@@ -1,144 +1,317 @@
 ===========================================================================================================
 -- PEPFAR Q4 for Mimosa dispensary: 2023-07-01 to 2023-09-30 
 ===========================================================================================================
-
--- Q4_2023_TX_NEW_v1_Mimosa_Disp.
-WITH transfer_ins AS (
-    -- A patient is a transfer-in only if ALL THREE questions are answered Yes
-    -- within the reporting period
+WITH all_enrolled AS (
+    SELECT
+        person_id  AS patient_id,
+        site_id,
+        DATE(value_datetime) AS art_start_date
+    FROM (
+        SELECT
+            o.person_id,
+            o.site_id,
+            o.value_datetime,
+            ROW_NUMBER() OVER (PARTITION BY o.person_id, o.site_id ORDER BY o.obs_datetime DESC) AS row_num
+        FROM obs PARTITION (p413) o
+        WHERE o.concept_id = 2516          -- date_art_started
+          AND o.voided = 0
+          AND o.value_datetime IS NOT NULL
+          AND DATE(o.value_datetime) BETWEEN '2023-07-01' AND '2023-09-30'
+    ) ranked
+    WHERE row_num = 1
+),
+-- ============================================================
+-- CTE 2 : ever_dispensed_in_quarter
+-- Patients who received an ARV dispensation during the quarter.
+-- Used as the entry gate — only patients appearing here are
+-- counted. Prevents phantom initiations with no drug record.
+-- ============================================================
+ever_dispensed_in_quarter AS ( 
     SELECT DISTINCT
-        o1.person_id AS patient_id,
-        o1.site_id
-    FROM obs PARTITION (p413) o1
-    JOIN obs PARTITION (p413) o2
-        ON  o2.person_id = o1.person_id
-        AND o2.site_id = o1.site_id
-        AND o2.concept_id = 7937  -- Ever registered on ART clinic before?
-        AND o2.value_coded = 1065  -- Yes
-        AND o2.voided = 0
-    JOIN obs PARTITION (p413) o3
-        ON  o3.person_id = o1.person_id
-        AND o3.site_id  = o1.site_id
-        AND o3.concept_id  = 6394 -- Has the patient taken ART in the last two weeks?
-        AND o3.value_coded = 1065 -- Yes
-        AND o3.voided = 0
-    WHERE o1.voided  = 0
-      AND o1.concept_id  = 7754 -- Ever received ARVs before?
-      AND o1.value_coded = 1065  -- Yes
-      AND DATE(o1.obs_datetime) BETWEEN '2023-07-01' AND '2023-09-30'
+        e.patient_id,
+        e.site_id
+    FROM encounter PARTITION (p413) e
+    JOIN obs o
+        ON  o.person_id = e.patient_id
+        AND o.site_id   = e.site_id
+    JOIN orders PARTITION (p413) od
+        ON  od.patient_id = o.person_id
+        AND od.site_id    = o.site_id
+        AND od.order_id   = o.order_id
+        AND od.voided     = 0
+    JOIN drug_order do
+        ON  do.order_id = od.order_id
+    JOIN arv_drug ad
+        ON  ad.drug_id  = do.drug_inventory_id
+    WHERE e.voided        = 0
+      AND e.encounter_type = 54              -- ARV dispensing encounter
+      AND do.quantity      > 0
+      AND DATE(od.start_date) BETWEEN '2023-07-01' AND '2023-09-30'
 ),
-active_clients AS (
--- TX_NEW definition: patients newly initiated on ART within the reporting period
+-- ============================================================
+-- CTE 3 : first_arv_dispensation
+-- Earliest ARV dispensation date per patient across ALL history
+-- (not just the quarter). This is the dispensation-side truth
+-- for TX_NEW vs transfer-in classification.
+-- Only evaluated for patients active in the quarter (via join
+-- to ever_dispensed_in_quarter).
+-- ============================================================
+first_arv_dispensation AS (
     SELECT
-        p.patient_id AS patient_id,
-        p.site_id,
-        p2.birthdate AS date_of_birth,
-        p2.gender,
-        ps.start_date AS art_start_date,
-        pp.date_enrolled,
-        CASE WHEN ti.patient_id IS NOT NULL THEN 1 ELSE 0 END AS is_transfer_in
-    FROM patient PARTITION (p413) p
-    JOIN person PARTITION (p413) p2
-        ON  p2.person_id = p.patient_id
-        AND p2.site_id   = p.site_id
-    JOIN patient_program PARTITION (p413) pp
-        ON  pp.patient_id = p.patient_id
-        AND pp.site_id    = p.site_id
-        AND pp.program_id = 1
-        AND pp.voided = 0
-    JOIN patient_state  PARTITION (p413) ps
-        ON  ps.patient_program_id = pp.patient_program_id
-        AND ps.site_id  = pp.site_id
-        AND ps.state = 7
-        AND ps.end_date IS NULL
-        AND ps.voided = 0
-        AND DATE(ps.start_date) BETWEEN '2023-07-01' AND  '2023-09-30'
-    LEFT JOIN transfer_ins ti
-        ON  ti.patient_id = p.patient_id
-        AND ti.site_id = p.site_id
-    WHERE p.voided  = 0
-      AND p2.voided = 0
+        od.patient_id,
+        od.site_id,
+        MIN(DATE(od.start_date)) AS first_arv_date
+    FROM orders PARTITION (p413) od
+    JOIN drug_order do
+        ON  do.order_id = od.order_id
+    JOIN arv_drug ad
+        ON  ad.drug_id  = do.drug_inventory_id
+    JOIN ever_dispensed_in_quarter edq
+        ON  edq.patient_id = od.patient_id
+        AND edq.site_id    = od.site_id
+    WHERE od.voided    = 0
+      AND do.quantity  > 0
+    GROUP BY od.patient_id, od.site_id
 ),
+-- ============================================================
+-- CTE 4 : art_last_taken
+-- Most recent patient-reported date of last ARV intake
+-- (concept 7751). Used to compute the transfer-in gap when
+-- ever_registered = 'yes'.
+-- ============================================================
+art_last_taken AS (
+    SELECT
+        person_id,
+        site_id,
+        DATE(value_datetime) AS art_last_taken_date
+    FROM (
+        SELECT
+            o.person_id,
+            o.site_id,
+            o.value_datetime,
+            ROW_NUMBER() OVER (PARTITION BY o.person_id, o.site_id ORDER BY o.obs_datetime DESC) AS row_num
+        FROM obs PARTITION (p413) o
+        WHERE o.concept_id = 7751          -- art_last_taken
+          AND o.voided = 0
+          AND o.value_datetime IS NOT NULL
+    ) ranked
+    WHERE row_num = 1
+),
+-- ============================================================
+-- CTE 5 : ever_registered
+-- Patient self-report: have you ever registered on ART?
+-- (concept 7937). Secondary signal — dispensation overrides
+-- when the two conflict.
+-- ============================================================
+ever_registered AS (
+    SELECT
+        person_id,
+        site_id,
+        CASE
+            WHEN value_coded = 1065 OR LOWER(value_text) = 'yes' THEN 'yes'
+            WHEN value_coded = 1066 OR LOWER(value_text) = 'no'  THEN 'no'
+            ELSE NULL
+        END AS ever_registered_on_art
+    FROM (
+        SELECT
+            o.person_id,
+            o.site_id,
+            o.value_coded,
+            o.value_text,
+            ROW_NUMBER() OVER (PARTITION BY o.person_id, o.site_id ORDER BY o.obs_datetime DESC) AS row_num
+        FROM obs PARTITION (p413) o
+        WHERE o.concept_id = 7937
+          AND o.voided     = 0
+    ) ranked
+    WHERE row_num = 1
+),
+-- ============================================================
+-- CTE 6 : cd4_obs
+-- Most recent CD4 count (concept 5497) recorded within 90 days
+-- before or on ART start date. Used for TX_NEW CD4 disaggregation.
+-- ============================================================
 cd4_obs AS (
--- Most recent CD4 (concept 5497) taken at or within 30 days BEFORE ART start.
     SELECT
-        o.person_id,
-        o.site_id,
-        o.value_numeric,
-        o.value_modifier,
-        ROW_NUMBER() OVER (PARTITION BY o.person_id, o.site_id ORDER BY o.obs_datetime DESC) AS row_num
-    FROM obs PARTITION (p413) o
-    JOIN active_clients ac
-        ON  ac.patient_id = o.person_id
-        AND ac.site_id = o.site_id
-        AND o.obs_datetime BETWEEN DATE_SUB(ac.art_start_date, INTERVAL 90 DAY) AND ac.art_start_date
-    WHERE o.voided = 0
-      AND o.concept_id = 5497
+        person_id,
+        site_id,
+        value_numeric,
+        value_modifier
+    FROM (
+        SELECT
+            o.person_id,
+            o.site_id,
+            o.value_numeric,
+            o.value_modifier,
+            ROW_NUMBER() OVER (PARTITION BY o.person_id, o.site_id ORDER BY o.obs_datetime DESC) AS row_num
+        FROM obs PARTITION (p413) o
+        JOIN all_enrolled ae
+            ON  ae.patient_id = o.person_id
+            AND ae.site_id = o.site_id
+            -- CD4 must fall within 90 days before ART start
+            AND DATE(o.obs_datetime) BETWEEN DATE_SUB(ae.art_start_date, INTERVAL 90 DAY) AND ae.art_start_date
+        WHERE o.voided     = 0
+          AND o.concept_id = 5497              -- CD4 count
+    ) ranked
+    WHERE row_num = 1
 ),
-pregnant_obs AS (
--- Female patients with a pregnancy flag during the reporting period
-    SELECT DISTINCT o.person_id, o.site_id
-    FROM obs PARTITION (p413) o
-    WHERE o.voided = 0
-      AND o.concept_id  IN (1434, 6131, 1755)  -- Is patient pregnant?
-      AND o.value_coded = 1065  -- Yes 
-      AND DATE(o.obs_datetime) BETWEEN '2023-07-01' AND '2023-09-30'
+-- ============================================================
+-- CTE 7 : reproductive_status
+-- Latest pregnancy / breastfeeding obs per patient within the
+-- reporting quarter. Restricted to enrolled cohort only.
+-- Concepts:
+--   Pregnant     : 1434, 6131, 1755  (yes = 1065, no = 1066)
+--   Breastfeeding: 5632, 7965        (yes = 1065)
+-- ============================================================
+reproductive_status AS (
+    SELECT
+        person_id,
+        site_id,
+        MAX(CASE
+            WHEN concept_id IN (1434, 6131, 1755)
+             AND (value_coded = 1065 OR LOWER(value_text) = 'yes')
+            THEN 1 ELSE 0
+        END) AS is_pregnant,
+        MAX(CASE
+            WHEN concept_id IN (1434, 6131, 1755)
+             AND (value_coded = 1066 OR LOWER(value_text) = 'no')
+            THEN 1 ELSE 0
+        END) AS is_not_pregnant,
+        MAX(CASE
+            WHEN concept_id IN (5632, 7965)
+             AND (value_coded = 1065 OR LOWER(value_text) = 'yes')
+            THEN 1 ELSE 0
+        END) AS is_breastfeeding
+    FROM (
+        SELECT
+            o.person_id,
+            o.site_id,
+            o.concept_id,
+            o.value_coded,
+            o.value_text,
+            ROW_NUMBER() OVER (PARTITION BY o.person_id, o.site_id, o.concept_id ORDER BY o.obs_datetime DESC) AS row_num
+        FROM obs PARTITION (p413) o
+        JOIN all_enrolled ae
+            ON  ae.patient_id = o.person_id
+            AND ae.site_id    = o.site_id
+        WHERE o.voided     = 0
+          AND o.concept_id IN (1434, 6131, 1755, 5632, 7965)
+          AND DATE(o.obs_datetime) BETWEEN '2023-07-01' AND '2023-09-30'
+    ) latest_per_concept
+    WHERE row_num = 1
+    GROUP BY person_id, site_id
 ),
-non_pregnant_obs AS (
--- Female patients with a Not pregnant during the reporting period
-    SELECT DISTINCT o.person_id, o.site_id
-    FROM obs PARTITION (p413) o
-    WHERE o.voided = 0
-      AND o.concept_id  IN (1434, 6131, 1755) -- Is patient pregnant?
-      AND o.value_coded = 1066 -- No
-      AND DATE(o.obs_datetime) BETWEEN '2023-07-01' AND '2023-09-30'
-),
-breastfeeding_obs AS (
--- Female patients with a breastfeeding flag during the reporting period
-    SELECT DISTINCT o.person_id, o.site_id
-    FROM obs PARTITION (p413) o
-    WHERE o.voided = 0
-      AND o.concept_id  IN (5632, 7965) -- Is Patient Breastfeeding?
-      AND o.value_coded = 1065
-      AND DATE(o.obs_datetime) BETWEEN '2023-07-01' AND '2023-09-30'
-),
+-- ============================================================
+-- CTE 8 : patient_summary
+-- Joins all CTEs above into one row per patient.
+-- Applies the classification hierarchy:
+--
+--   CONFLICT RULE (dispensation wins):
+--     A) ever_registered = 'no' BUT first_arv_date < '2023-07-01'
+--        → not_specified  (dispensation history predates quarter,
+--          self-report is unreliable)
+--     B) ever_registered = 'yes' AND art_last_taken IS NULL
+--        → fall back to DATEDIFF(art_start_date, first_arv_date)
+--          if gap > 14 → is_transfer_in, else not_specified
+--
+--   NORMAL FLOW:
+--     newly_enrolled : first_arv_date IN quarter
+--                      AND (ever_registered = 'no' OR NULL)
+--     is_transfer_in : ever_registered = 'yes'
+--                      AND gap > 14 (art_last_taken preferred,
+--                          first_arv_date as fallback)
+--     not_specified  : everything else
+-- ============================================================
 patient_summary AS (
     SELECT
-        ac.patient_id,
-        ac.site_id,
-        ac.is_transfer_in,
-        CASE WHEN ac.gender = 'M' THEN 'Male'
-             WHEN ac.gender = 'F' THEN 'Female'
-             ELSE 'Unknown gender'
-        END AS gender,
-        TIMESTAMPDIFF(YEAR, DATE(ac.date_of_birth), DATE(ac.art_start_date)) AS age_at_art_start,
-        CASE WHEN po.person_id  IS NOT NULL THEN 1 ELSE 0 END AS is_pregnant,
-        CASE WHEN npo.person_id  IS NOT NULL THEN 1 ELSE 0 END AS is_not_pregnant,
-        CASE WHEN bfo.person_id IS NOT NULL THEN 1 ELSE 0 END AS is_breastfeeding,
+        ae.patient_id,
+        ae.site_id,
+        ae.art_start_date,
+        p.gender,
+        TIMESTAMPDIFF(YEAR, p.birthdate, ae.art_start_date) AS age_at_art_start,
+        -- CD4 band for disaggregation
         CASE
-            WHEN cd4.value_numeric IS NULL THEN 'unknown'
-            WHEN cd4.value_numeric < 200 OR (cd4.value_modifier = '<' AND cd4.value_numeric <= 200) THEN 'lt200'
-            ELSE 'gtoe200'
-        END AS cd4_band
-    FROM active_clients ac
-    LEFT JOIN cd4_obs cd4
-        ON  cd4.person_id = ac.patient_id
-        AND cd4.site_id   = ac.site_id
-        AND cd4.row_num   = 1
-    LEFT JOIN pregnant_obs po
-        ON  po.person_id = ac.patient_id
-        AND po.site_id   = ac.site_id
-    LEFT JOIN non_pregnant_obs npo
-    	ON npo.person_id = ac.patient_id 
-    	AND npo.site_id = ac.site_id 
-    LEFT JOIN breastfeeding_obs bfo
-        ON  bfo.person_id = ac.patient_id
-        AND bfo.site_id   = ac.site_id
+            WHEN cd.value_numeric IS NOT NULL AND (cd.value_modifier = '<' OR cd.value_numeric < 200) THEN 'lt200'
+            WHEN cd.value_numeric >= 200 THEN 'gtoe200'
+            ELSE 'unknown'
+        END AS cd4_band,
+        -- Reproductive flags (NULL-safe defaults)
+        COALESCE(rs.is_pregnant,      0) AS is_pregnant,
+        COALESCE(rs.is_not_pregnant,  0) AS is_not_pregnant,
+        COALESCE(rs.is_breastfeeding, 0) AS is_breastfeeding,
+        -- -------------------------------------------------------
+        -- Patient type classification
+        -- Priority order:
+        --   1. Conflict check  — dispensation overrides self-report
+        --   2. Transfer-in     — ever_registered yes + gap > 14
+        --   3. Newly enrolled  — first ARV in quarter, no prior ART
+        --   4. Not specified   — cannot cleanly classify
+        -- -------------------------------------------------------
+        CASE
+            -- CONFLICT A: self-reports no prior ART but dispensation
+            -- history predates the quarter — override to not_specified
+            WHEN er.ever_registered_on_art = 'no'
+             AND fad.first_arv_date < '2023-07-01'
+            THEN 'not_specified'
+            -- TRANSFER-IN (primary path):
+            -- ever_registered = 'yes' AND art_last_taken gap > 14 days
+            WHEN er.ever_registered_on_art = 'yes'
+             AND alt.art_last_taken_date   IS NOT NULL
+             AND DATEDIFF(ae.art_start_date, alt.art_last_taken_date) > 14
+            THEN 'is_transfer_in'
+            -- TRANSFER-IN (fallback path — CONFLICT B):
+            -- ever_registered = 'yes' BUT art_last_taken IS NULL
+            -- use dispensation gap as proxy
+            WHEN er.ever_registered_on_art = 'yes'
+             AND alt.art_last_taken_date IS NULL
+             AND fad.first_arv_date IS NOT NULL
+             AND DATEDIFF(ae.art_start_date, fad.first_arv_date) > 14
+            THEN 'is_transfer_in'
+            -- NEWLY ENROLLED:
+            -- first ARV dispensation falls inside the quarter
+            -- AND no credible prior ART history
+            WHEN fad.first_arv_date BETWEEN '2023-07-01' AND '2023-09-30'
+             AND (er.ever_registered_on_art = 'no' OR er.ever_registered_on_art IS NULL)
+            THEN 'newly_enrolled'
+            -- NOT SPECIFIED: all remaining cases
+            ELSE 'not_specified'
+        END AS patient_type
+    FROM all_enrolled ae
+    -- Gender from person table
+    JOIN person p
+        ON  p.person_id = ae.patient_id
+        AND p.voided    = 0
+    -- Dispensation gate — only patients with a quarter dispensation count
+    JOIN ever_dispensed_in_quarter edq
+        ON  edq.patient_id = ae.patient_id
+        AND edq.site_id    = ae.site_id
+    -- All downstream CTEs are LEFT JOINed; a missing obs row
+    -- should never exclude a patient from the report
+    LEFT JOIN first_arv_dispensation fad
+        ON  fad.patient_id = ae.patient_id
+        AND fad.site_id    = ae.site_id
+    LEFT JOIN art_last_taken alt
+        ON  alt.person_id = ae.patient_id
+        AND alt.site_id   = ae.site_id
+    LEFT JOIN ever_registered er
+        ON  er.person_id = ae.patient_id
+        AND er.site_id   = ae.site_id
+    LEFT JOIN cd4_obs cd
+        ON  cd.person_id = ae.patient_id
+        AND cd.site_id   = ae.site_id
+    LEFT JOIN reproductive_status rs
+        ON  rs.person_id = ae.patient_id
+        AND rs.site_id   = ae.site_id
 ),
+-- ============================================================
+-- CTE 9 : patient_bands
+-- Assigns 5-year age bands based on age at ART start.
+-- Passes all patient_summary columns through unchanged.
+-- ============================================================
 patient_bands AS (
-    SELECT *,
+    SELECT
+        *,
         CASE
-            WHEN age_at_art_start < 1 THEN '<1 year'
+            WHEN age_at_art_start <  1 THEN '<1 year'
             WHEN age_at_art_start BETWEEN  1 AND  4 THEN '1-4 years'
             WHEN age_at_art_start BETWEEN  5 AND  9 THEN '5-9 years'
             WHEN age_at_art_start BETWEEN 10 AND 14 THEN '10-14 years'
@@ -163,130 +336,170 @@ patient_bands AS (
     FROM patient_summary
 )
 -- ============================================================
--- Section 1: Age-band rows — Female
+-- FINAL OUTPUT — 7 sections UNIONed
+-- Sections 1–2 : age-band rows by sex
+-- Sections 3–4 : all-ages totals by sex
+-- Sections 5–7 : female reproductive status totals
 -- ============================================================
+-- Section 1: Age-band rows — Female
 SELECT
     pb.site_id,
     pb.age_group,
     'Female' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in'  THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified'   THEN 1 END)   AS not_specified
 FROM patient_bands pb
-WHERE pb.gender = 'Female'
+WHERE pb.gender = 'F'
 GROUP BY pb.site_id, pb.age_group
--- UNION all
 UNION ALL
--- ============================================================
 -- Section 2: Age-band rows — Male
--- ============================================================
 SELECT
     pb.site_id,
     pb.age_group,
     'Male' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in'  THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified'   THEN 1 END)   AS not_specified
 FROM patient_bands pb
-WHERE pb.gender = 'Male'
+WHERE pb.gender = 'M'
 GROUP BY pb.site_id, pb.age_group
--- UNION all
 UNION ALL
--- ============================================================
 -- Section 3: Summary row — All Male
--- ============================================================
 SELECT
     pb.site_id,
     'All' AS age_group,
     'All M' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END)  AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in'  THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified'   THEN 1 END)   AS not_specified
 FROM patient_bands pb
-WHERE pb.gender = 'Male'
+WHERE pb.gender = 'M'
 GROUP BY pb.site_id
--- UNION all
 UNION ALL
--- ============================================================
 -- Section 4: Summary row — All Female
--- ============================================================
 SELECT
     pb.site_id,
     'All' AS age_group,
-    'All F' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    'All F'  AS gender,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in'  THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified'   THEN 1 END)   AS not_specified
 FROM patient_bands pb
-WHERE pb.gender = 'Female'
+WHERE pb.gender = 'F'
 GROUP BY pb.site_id
--- UNION all
 UNION ALL
 -- ============================================================
--- Section 5: Summary row — All FP (All Female Pregnant)
+-- Section 5: Summary row — All FP (Female Pregnant)
+-- Pregnant = 1, breastfeeding = 0 (mutually exclusive).
+-- CD4 < 200 column omitted — not disaggregated for repro rows.
 -- ============================================================
 SELECT
     pb.site_id,
     'All' AS age_group,
     'All FP' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    NULL  AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in'  THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified'   THEN 1 END)   AS not_specified
 FROM patient_bands pb
-WHERE pb.gender  = 'Female'
+WHERE pb.gender = 'F'
   AND pb.is_pregnant = 1
   AND pb.is_breastfeeding = 0
 GROUP BY pb.site_id
--- UNION all
 UNION ALL
 -- ============================================================
--- Section 6: Summary row — All FNP (All Female Not Pregnant)
+-- Section 6: Summary row — All FNP (Female Not Pregnant)
+-- Requires explicit documented NOT pregnant obs.
+-- Conflict guard in patient_summary ensures is_not_pregnant
+-- is never 1 when is_pregnant is also 1.
 -- ============================================================
 SELECT
     pb.site_id,
     'All' AS age_group,
-    'All FNP' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    'All FNP'AS gender,
+    NULL  AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in' THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified' THEN 1 END) AS not_specified
 FROM patient_bands pb
-WHERE pb.gender  = 'Female'
-  AND ((pb.is_not_pregnant = 1  AND pb.is_breastfeeding = 0 )
-  OR (pb.is_not_pregnant = 0 AND pb.is_breastfeeding = 0 AND pb.is_pregnant = 0))
+WHERE pb.gender = 'F'
+  AND pb.is_not_pregnant  = 1
+  AND pb.is_breastfeeding = 0
 GROUP BY pb.site_id
--- UNION all
 UNION ALL
 -- ============================================================
--- Section 7: Summary row — All FBF (All Female Breastfeeding)
+-- Section 7: Summary row — All FBF (Female Breastfeeding)
 -- ============================================================
 SELECT
     pb.site_id,
     'All' AS age_group,
     'All FBF' AS gender,
-    COUNT(CASE WHEN pb.cd4_band = 'lt200'   THEN 1 END) AS tx_new_cd4_less_than_200,
-    COUNT(CASE WHEN pb.cd4_band = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
-    COUNT(CASE WHEN pb.cd4_band = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
-    COUNT(CASE WHEN pb.is_transfer_in = 1   THEN 1 END) AS transfer_ins
+    NULL AS tx_new_cd4_less_than_200,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'gtoe200' THEN 1 END) AS tx_new_cd4_200_or_greater,
+    COUNT(CASE WHEN pb.patient_type = 'newly_enrolled'
+               AND  pb.cd4_band    = 'unknown' THEN 1 END) AS tx_new_cd4_unknown_or_not_done,
+    COUNT(CASE WHEN pb.patient_type = 'is_transfer_in'  THEN 1 END)   AS transfer_ins,
+    COUNT(CASE WHEN pb.patient_type = 'not_specified'   THEN 1 END)   AS not_specified
 FROM patient_bands pb
-WHERE pb.gender = 'Female'
+WHERE pb.gender = 'F'
   AND pb.is_breastfeeding = 1
 GROUP BY pb.site_id
-ORDER BY site_id,
-    CASE gender WHEN 'Female' THEN 1 WHEN 'Male' THEN 2 ELSE 3 END,
+ORDER BY
+    site_id,
+    -- Female rows first, then Male, then repro summaries
     CASE gender
-        WHEN 'All M' THEN 99
-        WHEN 'All F' THEN 99
-        WHEN 'All FP' THEN 100
-        WHEN 'All FBF' THEN 101
-        ELSE FIELD(age_group,
-            '<1 year','1-4 years','5-9 years','10-14 years','15-19 years',
-            '20-24 years','25-29 years','30-34 years','35-39 years','40-44 years',
-            '45-49 years','50-54 years','55-59 years','60-64 years','65-69 years',
-            '70-74 years','75-79 years','80-84 years','85-89 years','90 plus years')
+        WHEN 'Female'  THEN 1
+        WHEN 'All F'   THEN 2
+        WHEN 'All FP'  THEN 3
+        WHEN 'All FNP' THEN 4
+        WHEN 'All FBF' THEN 5
+        WHEN 'Male'    THEN 6
+        WHEN 'All M'   THEN 7
+        ELSE 8
+    END,
+    -- Within age-band sections, sort bands chronologically
+    CASE gender
+        WHEN 'Female' THEN
+            FIELD(age_group,
+                '<1 year','1-4 years','5-9 years','10-14 years','15-19 years',
+                '20-24 years','25-29 years','30-34 years','35-39 years','40-44 years',
+                '45-49 years','50-54 years','55-59 years','60-64 years','65-69 years',
+                '70-74 years','75-79 years','80-84 years','85-89 years','90 plus years',
+                'Age Unknown')
+        WHEN 'Male' THEN
+            FIELD(age_group,
+                '<1 year','1-4 years','5-9 years','10-14 years','15-19 years',
+                '20-24 years','25-29 years','30-34 years','35-39 years','40-44 years',
+                '45-49 years','50-54 years','55-59 years','60-64 years','65-69 years',
+                '70-74 years','75-79 years','80-84 years','85-89 years','90 plus years',
+                'Age Unknown')
+        ELSE 0
     END;
